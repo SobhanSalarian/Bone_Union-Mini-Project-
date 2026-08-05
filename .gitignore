@@ -1,0 +1,20 @@
+# Provided project data - restricted, must not be redistributed (see project brief)
+dataset/
+ct_sample/
+
+# Pretrained model weights (downloaded automatically by ultralytics)
+*.pt
+
+# Training run outputs (would embed dataset images via YOLO's plots)
+runs/
+
+# Jupyter
+.ipynb_checkpoints/
+
+# Python
+__pycache__/
+*.pyc
+
+# OS junk
+.DS_Store
+Thumbs.db
