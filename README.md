@@ -367,6 +367,69 @@ difference could be noise rather than a real effect of cropping. The
 Improvements section's suggestion of patient-level cross-validation would be the
 proper way to confirm these differences are real.
 
+### 4.3 Experiment — Classical ML second-stage filter for false positives
+
+*(Full code in `notebooks/part2_fp_filter_experiment.ipynb`.)*
+
+**Idea.** Since both approaches share a false-positive problem (the detector
+confusing other metal hardware for real sites), a small classical ML classifier -
+not a second neural network - was tried on top of Approach 1's predictions: for each
+predicted box, take a 16x16 grayscale crop from the original full-resolution image,
+flatten it to 256 raw pixel values, add 8 more numbers (crop brightness mean/std/
+min/max, box width, height, aspect ratio, and the detector's own confidence score),
+and train a Random Forest to classify each box as a real join or a false positive.
+The filter was trained on the detector's own predictions on the **train split**
+(828 candidate boxes: 685 real, 143 false positives) and tested on its predictions
+on the **test split** (166 candidates: 94 real, 72 false positives) - never seen
+during filter training.
+
+**Result: the filter did not meaningfully work.**
+
+| | Precision | Recall | False positives removed |
+|---|---|---|---|
+| YOLO alone (baseline) | 0.566 | 0.543 | - |
+| + Random Forest filter | 0.575 | 0.532 | 4/72 (5.6%) |
+
+It correctly removed only 4 of 72 test false positives, while incorrectly discarding
+2 real detections - moving precision from 0.566 to 0.575, barely different from
+baseline. Its own classification accuracy (58%) was barely above the 57% "always
+guess real" majority-class baseline.
+
+**Why it likely failed.** The filter's own feature importances explain a lot: every
+individual pixel feature carried almost no weight (average importance 0.0033 each),
+while the detector's own confidence score alone accounted for more importance
+(0.124) than any other single feature - i.e. the filter had learned little from
+image content beyond what the detector's confidence already encoded. That points to
+the real explanation: a genuine join and a confusable screw likely look similar in
+raw brightness/pixel terms (both are small bright blobs near bone) - the actual
+distinguishing signal is probably subtler bone-texture patterns that flattened pixel
+values and basic brightness statistics don't capture. The neural network itself,
+with far more parameters and a proper convolutional architecture, already struggles
+with exactly this distinction - a much smaller classical model on cruder features
+was always a long shot to do better.
+
+**A simpler alternative that actually works: just raise the confidence threshold.**
+If confidence was the filter's real signal, why not use it directly?
+
+| Confidence threshold | Precision | Recall |
+|---|---|---|
+| 0.25 (default used throughout) | 0.57 | 0.55 |
+| 0.40 | 0.65 | 0.47 |
+| 0.50 | 0.72 | 0.42 |
+| 0.60 | 0.73 | 0.27 |
+
+Raising the threshold to 0.5 takes precision from 0.57 to 0.72 - a real, explainable
+improvement, far bigger than the filter's negligible 0.566 -> 0.575 - at the honest
+cost of recall dropping to 0.42. This is a genuine precision/recall trade-off
+controlled by one number, achieving more than the whole extra classifier did.
+
+**Take-away.** Not every idea pans out, and this is a useful negative result: a
+content-based classical filter needs signal the content doesn't obviously contain at
+this crop size/feature simplicity, while the detector's own confidence score turned
+out to be the more informative signal all along. A more promising version of this
+idea (noted in Improvements) would reuse the neural network's own learned features
+rather than raw pixels.
+
 ---
 
 ## Discussion Questions
@@ -415,12 +478,23 @@ proper way to confirm these differences are real.
   detail (resize) or field of view (crop); a GPU would allow full 512px - or a larger
   crop at full resolution - training in a fraction of the time, without needing
   either trade-off.
-- **Reduce the false-positive rate.** Both approaches confuse other metal hardware
-  for osteotomy sites 43-47% of the time. Hard-negative mining (explicitly training
-  on crops of non-site hardware) or tuning the confidence threshold on validation
-  data could target this directly. For the crop model specifically, tightening
-  non-max-suppression (or its IoU threshold) could address its extra failure mode of
-  duplicate overlapping boxes at an already-correct site.
+- **Reduce the false-positive rate - raise the confidence threshold.** Tested
+  directly (see the filter experiment above): raising Approach 1's confidence
+  threshold from 0.25 to 0.5 takes test precision from 0.57 to 0.72, at the cost of
+  recall dropping to 0.42. Whether that trade is worth it depends on the clinical
+  use case (is a missed site or a spurious one more costly to double-check by hand),
+  but it's a real, cheap lever confirmed to work. Hard-negative mining (explicitly
+  training on crops of non-site hardware) is a complementary option that doesn't
+  cost recall. For the crop model specifically, tightening non-max-suppression could
+  address its extra failure mode of duplicate overlapping boxes at an
+  already-correct site.
+- **If revisiting the classical-ML filter idea, use learned features, not raw
+  pixels.** The Random Forest filter tried here barely worked (removed only 5.6% of
+  false positives) because flattened pixel values apparently don't capture what
+  actually distinguishes a real join from a similar-looking screw. A more promising
+  version would extract the CNN's own penultimate-layer embedding for each box
+  (richer, already-learned features) as the classifier's input instead of raw
+  pixels, rather than abandoning the second-stage-filter idea entirely.
 - **Cross-validate instead of trusting one fixed split.** Given the val/test
   performance gap and only 85 patients total, k-fold cross-validation at the patient
   level would give a more trustworthy performance estimate than a single 70/15/15
