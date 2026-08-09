@@ -367,6 +367,8 @@ difference could be noise rather than a real effect of cropping. The
 Improvements section's suggestion of patient-level cross-validation would be the
 proper way to confirm these differences are real.
 
+## **Our biggest concrete problem so far is false positives — the model confusing other metal screws/plates for real sites.**
+
 ---
 
 ## Discussion Questions
