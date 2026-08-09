@@ -311,17 +311,75 @@ consistent patterns behind the numbers above:
   but shows it hasn't fully learned to distinguish an actual bone join from hardware
   alone.
 
+### 4.3 Approach 2 — Cropping instead of resizing
+
+**Motivation.** Approach 1's resize (512 -> 320px) shrinks an already-small object:
+osteotomy site boxes average ~25x27px at the original 512px (smallest ~6x8px), which
+become ~16x17px on average (smallest ~4x5px) after the resize - very little pixel
+detail left for the model to learn from. Investigating whether this was hurting
+results, the box centers of all 1109 annotated boxes were checked: mean x-center
+0.504, mean y-center 0.378 (of image width/height) - i.e. sites are consistently
+positioned in a predictable region rather than scattered randomly across each slice.
+A search over candidate fixed 320x320 crop windows found one centered at pixel
+(272, 208) of the original 512x512 image that overlaps all but 3 of the 1109 boxes;
+after clipping those 3 partially-overlapping boxes to the visible region rather than
+dropping them, **all 1109 boxes were preserved with zero images lost**. Cropping to a
+fixed 320x320 window costs the same training time as resizing to 320x320 (compute
+depends on the input tensor size fed to the model, not on how that tensor was
+produced), so this was a "free" way to test whether resolution was the bottleneck.
+Everything else (patient split, model, epochs, batch size, seed) was kept identical
+to Approach 1 for a direct comparison.
+
+**Training.** 62 epochs (early-stopped, best at epoch 42), ~55 minutes - consistent
+with Approach 1's per-epoch speed, confirming cropping doesn't cost anything extra.
+
+**Test-set comparison** (same 123 test images, same 25 patients, never used for
+training or model selection in either approach):
+
+| Metric | Approach 1 (resize) | Approach 2 (crop) |
+|---|---|---|
+| Precision | 0.563 | 0.588 |
+| Recall | 0.549 | 0.527 |
+| mAP50 | 0.486 | 0.485 |
+| mAP50-95 | 0.139 | **0.160** |
+| False positive rate | 43.4% | 47.1% |
+| Images fully detected | 39/123 (31.7%) | 36/123 (29.3%) |
+| 2+ box images fully detected | 9/36 (25.0%) | 13/36 (36.1%) |
+
+**This is a genuinely mixed result, not a clean win for cropping.** mAP50-95 -
+the metric most sensitive to how tightly a box fits, since it's averaged across
+strict IoU thresholds - improved meaningfully (+15% relative), which is consistent
+with the original hypothesis: native-resolution boxes are drawn more precisely.
+Multi-box images also got noticeably better (36.1% vs 25.0% fully detected).
+But overall detection rate barely moved (mAP50 essentially unchanged, recall
+slightly down), and the false-positive rate got slightly *worse*, not better.
+Qualitative inspection shows why: the crop model's false positives are less often
+"confusing an unrelated screw for a site" (Approach 1's dominant failure) and more
+often **duplicate/near-duplicate boxes at a genuinely correct location** - e.g. one
+test image had all 3 real sites correctly found but with an extra overlapping box at
+each one, counted as 3 false positives despite the location being right. So cropping
+did help the model localise sites more precisely once it found them, but didn't fix
+the deeper issue of distinguishing a real site from other bright metal in the slice.
+
+**Caveat.** Both approaches use a single fixed 70/15/15 split with only 123 test
+images, and `cache='ram'` introduces some run-to-run non-determinism; part of this
+difference could be noise rather than a real effect of cropping. The
+Improvements section's suggestion of patient-level cross-validation would be the
+proper way to confirm these differences are real.
+
 ---
 
 ## Discussion Questions
 
 ### Limitations
 
-- **No GPU access, worked around by shrinking the input images.** Training is
-  CPU-only on this machine. Downsizing input images (512 -> 320px) and caching data
-  in RAM cut training to ~52s/epoch, making a full 73-epoch run (~63 minutes)
-  feasible - but that downsize is a real accuracy trade-off for small objects like
-  these, and a GPU would allow full-resolution training in a fraction of the time.
+- **No GPU access, worked around by shrinking/cropping the input images.** Training
+  is CPU-only on this machine. Two CPU-friendly 320x320 input strategies were tried
+  (resize the whole image, and crop a fixed native-resolution window - see Approach
+  2), both taking ~1 hour rather than the ~3-4 hours a full-resolution 512px run
+  would need. Cropping recovered some of the resize's lost precision but neither
+  matches what full-resolution training (or a larger model, or more epochs) could
+  likely achieve with a GPU in the same wall-clock time.
 - **2D, per-slice detection discards 3D continuity.** The pipeline detects boxes
   independently on each slice, with no mechanism to use the fact that the same
   osteotomy site is almost certainly also present on the adjacent slices.
@@ -333,10 +391,13 @@ consistent patterns behind the numbers above:
   checkpoint chosen specifically because it scored well on val, some of that gap is
   expected optimism bias rather than a genuine difference in difficulty, but a split
   this small makes the two hard to fully disentangle.
-- **The model confuses other metal hardware for osteotomy sites.** 43.4% of the
-  test set's predicted boxes were false positives (Task 4), and qualitative
-  inspection (Task 5) shows the model repeatedly firing on screws/plates elsewhere in
-  the slice that look similar to an actual join but aren't one.
+- **The model confuses other metal hardware for osteotomy sites, in both
+  approaches.** 43-47% of predicted boxes were false positives on the test set in
+  both Approach 1 and Approach 2. Qualitative inspection shows the resize model
+  mainly firing on unrelated screws/plates elsewhere in the slice, while the crop
+  model's false positives are more often duplicate/overlapping boxes at an already
+  correctly-found site - different symptoms, but neither approach fixes the
+  underlying issue of confidently telling a real join apart from other bright metal.
 - **Raw CT data quality issues.** Part 1's analysis found the volume's raw intensity
   range to be **-16040 HU to 32767 HU**, far outside the physiological range (roughly
   -1000 HU for air up to a few thousand HU for dense bone/metal). The maximum,
@@ -350,13 +411,16 @@ consistent patterns behind the numbers above:
 
 ### Improvements
 
-- **Train at full resolution with a GPU.** The 320px downsize was a CPU-time
-  trade-off; a GPU would allow full 512px (or larger) training in a fraction of the
-  time, likely recovering some of the precision lost to downsizing small objects.
-- **Reduce the false-positive rate.** Since the model concretely confuses other
-  metal hardware for osteotomy sites, hard-negative mining (explicitly training on
-  crops of non-site hardware) or tuning the confidence threshold on validation data
-  could directly target the 43% false-positive rate seen on test.
+- **Train at full resolution with a GPU.** Both 320px strategies traded away either
+  detail (resize) or field of view (crop); a GPU would allow full 512px - or a larger
+  crop at full resolution - training in a fraction of the time, without needing
+  either trade-off.
+- **Reduce the false-positive rate.** Both approaches confuse other metal hardware
+  for osteotomy sites 43-47% of the time. Hard-negative mining (explicitly training
+  on crops of non-site hardware) or tuning the confidence threshold on validation
+  data could target this directly. For the crop model specifically, tightening
+  non-max-suppression (or its IoU threshold) could address its extra failure mode of
+  duplicate overlapping boxes at an already-correct site.
 - **Cross-validate instead of trusting one fixed split.** Given the val/test
   performance gap and only 85 patients total, k-fold cross-validation at the patient
   level would give a more trustworthy performance estimate than a single 70/15/15

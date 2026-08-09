@@ -21,3 +21,4 @@ Thumbs.db
 
 # Local-only qualitative outputs (contain dataset images, not for the public repo)
 qualitative_results/
+qualitative_results_cropped/
