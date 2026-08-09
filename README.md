@@ -223,52 +223,93 @@ provided labels are already in YOLO's normalized box format, so no annotation
 conversion was needed; the dataset is small (574 training images from 35 patients),
 which favours transfer learning from a pretrained backbone over training a detector
 from random weights; and it is a single-class, small-object task, which YOLO's
-architecture handles well. Images were used at their native 512x512 resolution.
+architecture handles well.
 
-**This task was not completed to a real trained model, due to a hardware/time
-constraint discovered during setup.** This machine has no GPU (CPU-only PyTorch). A
-timed, full-configuration 1-epoch run measured **~122 seconds per epoch**. A proper
-training schedule (on the order of 100 epochs with early stopping, as would normally
-be used for a dataset this size) would therefore take on the order of **3-4 hours**,
-which was not available in the time given for this submission.
+**Optimizing for CPU-only training.** This machine has no GPU. An initial
+full-resolution (512px) run measured ~122 seconds/epoch, making a full ~100-epoch
+schedule take 3-4 hours. Three changes brought this down to **52 seconds/epoch** (a
+2.3x speedup), verified on a 1-epoch timing test before committing to a full run:
+smaller input size (512 -> 320px, cutting per-image compute to ~39%, since osteotomy
+sites are small localized features against mostly-irrelevant background); in-RAM
+image caching (`cache='ram'`, since the original run's log showed a "slow image
+access" disk I/O warning, not just a compute bottleneck); and a larger batch size
+(16 -> 32, reducing fixed per-batch overhead). This made a full, real training run
+feasible in the time available.
 
-**What was verified instead.** Rather than leave the pipeline unproven, a single
-1-epoch proof-of-concept run was executed end-to-end (data loading and augmentation,
-the YOLOv8 training loop, loss computation, and validation), with plotting disabled so
-that no dataset images would be embedded in the saved run artifacts (this dataset must
-not be redistributed, and Ultralytics' default plots save training/validation image
-mosaics). Within that single epoch, the training losses decreased consistently across
-all 36 batches:
-```
-box_loss: 4.945 -> 3.898
-cls_loss: 7.823 -> 6.866
-dfl_loss: 3.089 -> 1.836
-```
-This confirms the pipeline is functionally correct end-to-end and that gradients are
-flowing (the model is fitting to the data), but one epoch is nowhere near enough
-training for a usable detector — the resulting validation mAP50 was effectively zero
-(~1.3e-6), as expected this early, especially given YOLO's learning-rate warmup and
-mosaic augmentation schedule are tuned for a much longer run. The weights produced by
-this run are not evaluated further, since they do not represent a meaningfully trained
-model.
+**Training run.** 100 epochs budgeted, patience=20 for early stopping. Training
+stopped early at **epoch 73** (best validation performance was at epoch 53, by
+mAP50-95), taking **~63 minutes** total — matching the measured 52s/epoch rate.
+Losses decreased steadily throughout (train box_loss 4.29 -> 1.88, cls_loss 5.97 ->
+0.87), and validation performance at the best epoch reached precision ~0.79, recall
+~0.61, mAP50 ~0.71, mAP50-95 ~0.23. `plots=False` was kept so Ultralytics does not
+save training/validation image mosaics (which would embed dataset slices); the
+trained weights themselves are a derived model, not raw data, so are fine to keep.
 
 ### 4.3 Task 4 — Evaluation and analysis
 
-**Not completed**, as a direct consequence of Task 3: without a properly trained
-model, there is no meaningful evaluation to report. Had training completed, the plan
-was to report standard detection metrics (precision, recall, mAP50 and mAP50-95) on
-the held-out test split defined in Task 2, broken down overall and, given the box-count
-distribution found in Task 1, separately for single-box vs. multi-box images, to check
-whether the model handles slices with more than one osteotomy site as reliably as the
-more common single-site slices.
+The best checkpoint (selected on validation performance, patient-disjoint from
+training) was evaluated once on the **held-out test split** — 123 images from 25
+patients never used in training or model selection:
+
+```
+Precision: 0.563
+Recall:    0.549
+mAP50:     0.486
+mAP50-95:  0.139
+```
+
+**Test performance is noticeably below validation performance** (precision 0.56 vs.
+0.79, mAP50 0.49 vs. 0.71). With only 123 images in each of val and test, and the
+best checkpoint having been selected specifically because it scored well on val, some
+of this gap is expected optimistic bias from model selection rather than a genuine
+difference in the two splits' difficulty — a known risk of using a single fixed
+split this small, and part of why the Improvements section below suggests
+cross-validation as a follow-up.
+
+**Breakdown by number of ground-truth boxes per image** (tying back to Task 1's
+finding that most images have 1 box, some have 2+): predicted boxes were matched to
+ground-truth boxes by IoU >= 0.5.
+
+| Group | Images | GT boxes | Box-level recall | Images fully detected |
+|---|---|---|---|---|
+| 1 box | 87 | 87 | 0.529 | 46/87 (52.9%) |
+| 2+ boxes | 36 | 86 | 0.558 | 9/36 (25.0%) |
+
+Box-level recall is similar between the two groups (~0.53 vs ~0.56) — the model is
+not meaningfully worse at finding any *individual* box in a multi-box image. But the
+**image fully correct** rate drops sharply for multi-box images (25.0% vs 52.9%),
+simply because getting every box right in an image gets combinatorially harder as
+the number of boxes grows — one miss anywhere in the image counts against it.
+
+**False positives are a significant failure mode**: of 166 total predicted boxes
+across the test set, 72 (43.4%) were false positives (no matching ground-truth box).
+Only 39/123 test images (31.7%) were detected perfectly (all ground truth found, no
+extra boxes); 68/123 (55.3%) had at least one missed box, and 58/123 (47.2%) had at
+least one false positive.
 
 ### 4.3 Task 5 — Qualitative results
 
-**Not completed**, for the same reason as Task 4: there is no meaningfully trained
-model to draw predictions from, so overlaying predicted vs. ground-truth boxes would
-not be an informative comparison. The data-loading and box-denormalization logic
-needed to produce such overlays is already in place from Tasks 1-3 and would only
-need a trained checkpoint to be used.
+Predicted vs. ground-truth boxes (green = ground truth, red = prediction) were
+rendered for representative success and failure cases and saved locally to
+`qualitative_results/` (excluded from this public repo via `.gitignore`, since the
+images embed actual dataset slices — see `notebooks/part2_train.ipynb` to regenerate
+them once you have dataset access). Visual inspection of these examples shows two
+consistent patterns behind the numbers above:
+
+- **Successful cases** show tight, accurate boxes right at the graft-to-bone join,
+  immediately next to the bright metal fixation hardware — including multi-box
+  images where both left and right sides of the reconstruction are correctly found
+  in the same slice.
+- **Missed-detection cases** tend to involve a subtler third site that is harder to
+  distinguish from surrounding bone, or a site whose predicted box is close but not
+  quite overlapping enough (< 0.5 IoU) to count as a match — a box precision issue as
+  much as a "didn't see it at all" issue.
+- **False-positive cases** consistently show the model firing on *other* bright
+  metal hardware in the slice — screws elsewhere on the plate that resemble an
+  osteotomy site's appearance but are not one. This is a sensible confusion for the
+  model to make (it has genuinely learned "bright metal near bone" as a strong cue)
+  but shows it hasn't fully learned to distinguish an actual bone join from hardware
+  alone.
 
 ---
 
@@ -276,17 +317,26 @@ need a trained checkpoint to be used.
 
 ### Limitations
 
-- **No GPU access.** Training is CPU-only on this machine (~122s/epoch measured), so a
-  full run (~100 epochs, several hours) was infeasible in the time available. Tasks 4
-  and 5 (evaluation and qualitative results) could not be produced against a real
-  trained model as a result.
+- **No GPU access, worked around by shrinking the input images.** Training is
+  CPU-only on this machine. Downsizing input images (512 -> 320px) and caching data
+  in RAM cut training to ~52s/epoch, making a full 73-epoch run (~63 minutes)
+  feasible - but that downsize is a real accuracy trade-off for small objects like
+  these, and a GPU would allow full-resolution training in a fraction of the time.
 - **2D, per-slice detection discards 3D continuity.** The pipeline detects boxes
   independently on each slice, with no mechanism to use the fact that the same
   osteotomy site is almost certainly also present on the adjacent slices.
-- **Small, patient-imbalanced dataset.** 820 images come from only 85 patients, and 5
-  of those patients supply about 44% of the images (Task 1), so the effective
-  diversity is much lower than the image count suggests - this had to be handled
-  explicitly when constructing the split (Task 2).
+- **Small, patient-imbalanced dataset, and a resulting small eval set.** 820 images
+  come from only 85 patients, 5 of whom supply about 44% of the images (Task 1), so
+  effective diversity is much lower than the image count suggests. A consequence
+  shows up directly in Task 4: test mAP50 (0.49) is well below validation mAP50
+  (0.71) for the same checkpoint - with only 123 images in each split, and the
+  checkpoint chosen specifically because it scored well on val, some of that gap is
+  expected optimism bias rather than a genuine difference in difficulty, but a split
+  this small makes the two hard to fully disentangle.
+- **The model confuses other metal hardware for osteotomy sites.** 43.4% of the
+  test set's predicted boxes were false positives (Task 4), and qualitative
+  inspection (Task 5) shows the model repeatedly firing on screws/plates elsewhere in
+  the slice that look similar to an actual join but aren't one.
 - **Raw CT data quality issues.** Part 1's analysis found the volume's raw intensity
   range to be **-16040 HU to 32767 HU**, far outside the physiological range (roughly
   -1000 HU for air up to a few thousand HU for dense bone/metal). The maximum,
@@ -300,8 +350,17 @@ need a trained checkpoint to be used.
 
 ### Improvements
 
-- **Use a GPU.** This alone unblocks everything else - a real training run, then the
-  evaluation and qualitative results this submission is missing.
+- **Train at full resolution with a GPU.** The 320px downsize was a CPU-time
+  trade-off; a GPU would allow full 512px (or larger) training in a fraction of the
+  time, likely recovering some of the precision lost to downsizing small objects.
+- **Reduce the false-positive rate.** Since the model concretely confuses other
+  metal hardware for osteotomy sites, hard-negative mining (explicitly training on
+  crops of non-site hardware) or tuning the confidence threshold on validation data
+  could directly target the 43% false-positive rate seen on test.
+- **Cross-validate instead of trusting one fixed split.** Given the val/test
+  performance gap and only 85 patients total, k-fold cross-validation at the patient
+  level would give a more trustworthy performance estimate than a single 70/15/15
+  split.
 - **Show the model neighbouring slices, not just one.** An osteotomy site spans
   several slices, but the model currently looks at each slice alone. Feeding it a
   slice plus its neighbours would let it use that context instead of ignoring it.
