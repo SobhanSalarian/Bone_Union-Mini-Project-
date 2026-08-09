@@ -369,19 +369,69 @@ proper way to confirm these differences are real.
 
 ## **Our biggest concrete problem so far is false positives — the model confusing other metal screws/plates for real sites.**
 
----
+### 4.3 Approach 3 — Explicit metal mask as a third input channel
+
+*(Full code in `notebooks/part2_train_metalmask.ipynb`.)*
+
+**Idea.** Approach 1's dominant false-positive mode was the detector confusing
+unrelated metal hardware for real sites. Normally the model only gets raw brightness
+- a plain grayscale image duplicated into all three (R, G, B) input channels - and
+has to infer "this bright blob is metal, not bone" entirely on its own. Part 1 found
+that metal saturates to the maximum representable intensity in the raw HU volume; the
+same holds in this dataset's 8-bit exported JPGs, where a simple brightness threshold
+(pixel >= 220 of 255) cleanly isolates just the screws/plate from the surrounding
+bone (checked visually first). Replacing the usual channel duplication with
+**R=raw, G=metal mask, B=raw** hands the model this segmentation for free, so it can
+spend its learning capacity on the surrounding bone texture instead of re-deriving
+"bright = metal" from scratch. Everything else was kept identical to Approach 1
+(resize, not crop; same split, epochs, batch, seed) for a clean, single-variable
+comparison.
+
+**Training.** 53 epochs (early-stopped, best at epoch 33), ~46 minutes - actually
+faster than Approach 1, since it converged to its best point sooner.
+
+**Test-set comparison** (same 123 test images, same 25 patients, all three
+approaches):
+
+| Metric | Approach 1 (resize) | Approach 2 (crop) | **Approach 3 (metal mask)** |
+|---|---|---|---|
+| Precision | 0.563 | 0.588 | **0.656** |
+| Recall | 0.549 | 0.527 | 0.538 |
+| mAP50 | 0.486 | 0.485 | **0.502** |
+| mAP50-95 | 0.139 | 0.160 | 0.140 |
+| False positive rate | 43.4% | 47.1% | **29.8%** |
+| Images fully detected | 39/123 (31.7%) | 36/123 (29.3%) | **50/123 (40.7%)** |
+
+**This is a genuine, meaningful win** - unlike Approach 2's mixed result. Precision
+jumped from 0.563 to 0.656 (+17% relative) while recall barely moved (0.549 ->
+0.538), and the false-positive rate dropped from 43.4% to 29.8% - the biggest
+improvement of any change tried so far on the exact problem called out above.
+Perfectly-detected images rose from 31.7% to 40.7%. Qualitative inspection of the
+remaining errors is telling: the leftover false positives are now mostly **near
+misses right next to a real site** (a box offset from the true join, close but under
+the 0.5 IoU match threshold) rather than confident detections on completely unrelated
+hardware elsewhere in the slice - i.e. the specific failure mode this change targeted
+does look substantially reduced, and what's left looks more like a localization
+precision issue than a content-confusion issue.
+
+**Why this one worked when the others gave mixed/negative results**: unlike the
+crop (Approach 2, which improved localization precision but not detection
+content) or the classical-ML filter (which tried to learn a distinction from raw
+pixels after the fact), this change gives the model pre-computed domain knowledge
+inline, before it ever has to learn anything - it doesn't have to discover on its
+own that "very bright = metal", freeing capacity for the harder, more subtle part of
+the task.
 
 ## Discussion Questions
 
 ### Limitations
 
 - **No GPU access, worked around by shrinking/cropping the input images.** Training
-  is CPU-only on this machine. Two CPU-friendly 320x320 input strategies were tried
-  (resize the whole image, and crop a fixed native-resolution window - see Approach
-  2), both taking ~1 hour rather than the ~3-4 hours a full-resolution 512px run
-  would need. Cropping recovered some of the resize's lost precision but neither
-  matches what full-resolution training (or a larger model, or more epochs) could
-  likely achieve with a GPU in the same wall-clock time.
+  is CPU-only on this machine. All three approaches use a 320x320 input (resize,
+  native-resolution crop, or resize plus a metal-mask channel), each taking under an
+  hour rather than the ~3-4 hours a full-resolution 512px run would need. None of
+  them matches what full-resolution training (or a larger model, or more epochs)
+  could likely achieve with a GPU in the same wall-clock time.
 - **2D, per-slice detection discards 3D continuity.** The pipeline detects boxes
   independently on each slice, with no mechanism to use the fact that the same
   osteotomy site is almost certainly also present on the adjacent slices.
@@ -393,13 +443,13 @@ proper way to confirm these differences are real.
   checkpoint chosen specifically because it scored well on val, some of that gap is
   expected optimism bias rather than a genuine difference in difficulty, but a split
   this small makes the two hard to fully disentangle.
-- **The model confuses other metal hardware for osteotomy sites, in both
-  approaches.** 43-47% of predicted boxes were false positives on the test set in
-  both Approach 1 and Approach 2. Qualitative inspection shows the resize model
-  mainly firing on unrelated screws/plates elsewhere in the slice, while the crop
-  model's false positives are more often duplicate/overlapping boxes at an already
-  correctly-found site - different symptoms, but neither approach fixes the
-  underlying issue of confidently telling a real join apart from other bright metal.
+- **The model confuses other metal hardware for osteotomy sites - reduced, but not
+  solved, by Approach 3.** 43-47% of predicted boxes were false positives on the
+  test set for Approaches 1 and 2. Giving the model an explicit metal-location
+  channel (Approach 3) cut this to 29.8% and raised precision from 0.563 to 0.656 -
+  a real improvement - but did not eliminate the problem, and the underlying task of
+  confidently telling a real join apart from other bright metal remains only
+  partially solved.
 - **Raw CT data quality issues.** Part 1's analysis found the volume's raw intensity
   range to be **-16040 HU to 32767 HU**, far outside the physiological range (roughly
   -1000 HU for air up to a few thousand HU for dense bone/metal). The maximum,
@@ -417,12 +467,13 @@ proper way to confirm these differences are real.
   detail (resize) or field of view (crop); a GPU would allow full 512px - or a larger
   crop at full resolution - training in a fraction of the time, without needing
   either trade-off.
-- **Reduce the false-positive rate.** Both approaches confuse other metal hardware
-  for osteotomy sites 43-47% of the time. Hard-negative mining (explicitly training
-  on crops of non-site hardware) or tuning the confidence threshold on validation
-  data could target this directly. For the crop model specifically, tightening
-  non-max-suppression (or its IoU threshold) could address its extra failure mode of
-  duplicate overlapping boxes at an already-correct site.
+- **Build on Approach 3 rather than stopping there.** The metal-mask channel cut
+  the false-positive rate from 43.4% to 29.8% - real progress, but 29.8% is still
+  substantial. Natural next steps: combine the metal-mask channel with Approach 2's
+  native-resolution crop (they address different parts of the problem and aren't
+  mutually exclusive); hard-negative mining (explicitly training on crops of
+  non-site hardware); or tuning the confidence threshold on validation data for a
+  further precision/recall trade-off on top of what Approach 3 already gives.
 - **Cross-validate instead of trusting one fixed split.** Given the val/test
   performance gap and only 85 patients total, k-fold cross-validation at the patient
   level would give a more trustworthy performance estimate than a single 70/15/15
